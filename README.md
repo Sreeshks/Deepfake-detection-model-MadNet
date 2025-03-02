@@ -24,7 +24,7 @@ Enhanced MADNet is an advanced deepfake detection system that classifies videos 
 ```bash
 pip install tensorflow numpy
 
-
+```
 data/
 ├── train/
 │   ├── real/
@@ -41,7 +41,9 @@ data/
 Prepare your dataset in the required structure
 Update the data paths in the example usage section
 Run the script:
+```bash
 python madnet_enhanced.py
+```
 **Model Architecture**
 Base Model: EfficientNetB0
 Temporal Analysis: Dual LSTM layers (256 and 128 units)
