@@ -1,0 +1,257 @@
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.layers import (
+    Input, Dense, GlobalAveragePooling2D, LSTM, Dropout, 
+    TimeDistributed, Concatenate, BatchNormalization,
+    Bidirectional
+)
+from tensorflow.keras.models import Model
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.optimizers import Adam
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+
+print("TensorFlow version:", tf.__version__)
+
+class DatasetPreparation:
+    def __init__(self, input_shape=(224, 224, 3), seq_length=10):
+        self.input_shape = input_shape
+        self.seq_length = seq_length
+        self.class_mapping = {'real': 0, 'fake': 1}
+        
+    def data_augmentation(self):
+        return tf.keras.Sequential([
+            tf.keras.layers.RandomFlip("horizontal"),
+            tf.keras.layers.RandomRotation(0.1),
+            tf.keras.layers.RandomZoom(0.1),
+            tf.keras.layers.RandomContrast(0.1),
+        ])
+
+    def preprocess_image(self, img_path, augment=False):
+        try:
+            img = tf.io.read_file(img_path)
+            img = tf.image.decode_png(img, channels=3)
+            img = tf.image.resize(img, self.input_shape[:2])
+            if augment:
+                img = self.data_augmentation()(img)
+            img = tf.keras.applications.efficientnet.preprocess_input(img)
+            return img
+        except:
+            return tf.zeros(self.input_shape)
+
+    def create_dataset(self, directory, batch_size=8, augment=False):
+        paths = []
+        labels = []
+        sequence_paths = []
+
+        for class_name in self.class_mapping.keys():
+            class_dir = os.path.join(directory, class_name)
+            if not os.path.exists(class_dir):
+                continue
+
+            img_paths = []
+            for img_name in sorted(os.listdir(class_dir)):
+                if img_name.lower().endswith('.png'):
+                    img_paths.append(os.path.join(class_dir, img_name))
+            
+            for i in range(0, len(img_paths) - self.seq_length + 1, self.seq_length // 2):
+                sequence = img_paths[i:i+self.seq_length]
+                sequence_paths.append(sequence)
+                labels.append(self.class_mapping[class_name])
+                paths.append(img_paths[i + self.seq_length // 2])
+
+        def load_and_preprocess(path, label):
+            img = self.preprocess_image(path, augment)
+            return img, tf.one_hot(label, depth=len(self.class_mapping))
+
+        @tf.function
+        def load_sequence(seq_paths, label):
+            sequence = tf.map_fn(
+                lambda p: self.preprocess_image(p, augment),
+                seq_paths,
+                fn_output_signature=tf.float32
+            )
+            return sequence, tf.one_hot(label, depth=len(self.class_mapping))
+
+        frame_dataset = tf.data.Dataset.from_tensor_slices((paths, labels))
+        frame_dataset = frame_dataset.map(
+            load_and_preprocess, 
+            num_parallel_calls=tf.data.AUTOTUNE
+        )
+
+        sequence_dataset = tf.data.Dataset.from_tensor_slices((sequence_paths, labels))
+        sequence_dataset = sequence_dataset.map(
+            load_sequence, 
+            num_parallel_calls=tf.data.AUTOTUNE
+        )
+
+        dataset = tf.data.Dataset.zip((frame_dataset, sequence_dataset))
+        dataset = dataset.map(
+            lambda frame_data, seq_data: ((frame_data[0], seq_data[0]), seq_data[1]),
+            num_parallel_calls=tf.data.AUTOTUNE
+        )
+
+        buffer_size = min(1000, len(paths))
+        dataset = dataset.shuffle(buffer_size=buffer_size).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        return dataset
+
+class EnhancedMADNet:
+    def __init__(self, input_shape=(224, 224, 3), seq_length=10, num_classes=2):
+        self.input_shape = input_shape
+        self.seq_length = seq_length
+        self.num_classes = num_classes
+        self.model = self._build_model()
+
+    def _build_model(self):
+        frame_input = Input(shape=self.input_shape, name="Frame_Input")
+        
+        try:
+            base_model = EfficientNetB0(weights="imagenet", include_top=False, 
+                                      input_shape=self.input_shape)
+            print("Successfully loaded pre-trained EfficientNetB0 weights")
+        except Exception as e:
+            print(f"Failed to load pre-trained weights: {str(e)}")
+            print("Initializing with random weights instead")
+            base_model = EfficientNetB0(weights=None, include_top=False, 
+                                      input_shape=self.input_shape)
+            
+        frame_features = base_model(frame_input)
+        spatial_features = GlobalAveragePooling2D()(frame_features)
+        
+        sequence_input = Input(shape=(self.seq_length, *self.input_shape), name="Sequence_Input")
+        time_distributed = TimeDistributed(base_model)(sequence_input)
+        temporal_pool = TimeDistributed(GlobalAveragePooling2D())(time_distributed)
+        temporal_features = Bidirectional(LSTM(256, return_sequences=False))(temporal_pool)
+        
+        combined = Concatenate()([spatial_features, temporal_features])
+        x = BatchNormalization()(combined)
+        x = Dense(512, activation="relu")(x)
+        x = Dropout(0.5)(x)
+        x = Dense(256, activation="relu")(x)
+        x = Dropout(0.4)(x)
+        output = Dense(self.num_classes, activation="softmax", name="Output")(x)
+
+        return Model(inputs=[frame_input, sequence_input], outputs=output)
+
+class Trainer:
+    def __init__(self, model, learning_rate=0.001):
+        self.model = model
+        self.optimizer = Adam(learning_rate=learning_rate)
+        self.model.compile(
+            optimizer=self.optimizer,
+            loss="categorical_crossentropy",
+            metrics=["accuracy", tf.keras.metrics.AUC()]
+        )
+        self.history = None
+
+    def train(self, train_dataset, valid_dataset, epochs=30, batch_size=8):
+        checkpoint_dir = "checkpoints"
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        callbacks = [
+            EarlyStopping(monitor="val_loss", patience=7, restore_best_weights=True),
+            ReduceLROnPlateau(monitor="val_loss", factor=0.2, patience=3, min_lr=1e-6),
+            ModelCheckpoint(
+                os.path.join(checkpoint_dir, "model_{epoch:02d}_{val_loss:.4f}.keras"),
+                monitor="val_loss",
+                save_best_only=True
+            )
+        ]
+
+        self.history = self.model.fit(
+            train_dataset,
+            validation_data=valid_dataset,
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=callbacks
+        )
+        return self.history
+
+    def evaluate(self, test_dataset):
+        results = self.model.evaluate(test_dataset)
+        print(f"Test Loss: {results[0]:.4f}")
+        print(f"Test Accuracy: {results[1]:.4f}")
+        print(f"Test AUC: {results[2]:.4f}")
+        return results
+
+    def predict_and_analyze(self, test_dataset):
+        true_labels = []
+        for _, labels in test_dataset:
+            true_labels.extend(np.argmax(labels.numpy(), axis=1))
+        
+        predictions = self.model.predict(test_dataset)
+        pred_labels = np.argmax(predictions, axis=1)
+        
+        cm = confusion_matrix(true_labels, pred_labels)
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                   xticklabels=['Real', 'Fake'], yticklabels=['Real', 'Fake'])
+        plt.savefig('confusion_matrix.png')
+        plt.close()
+        
+        report = classification_report(true_labels, pred_labels, target_names=['Real', 'Fake'])
+        print("Classification Report:")
+        print(report)
+        with open('classification_report.txt', 'w') as f:
+            f.write(report)
+        
+        return cm, report
+
+    def save_model(self, path="madnet_faceforensics.keras"):
+        self.model.save(path)
+
+    def plot_training_history(self):
+        if self.history is None:
+            return
+        
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 2, 1)
+        plt.plot(self.history.history['accuracy'], label='Train Acc')
+        plt.plot(self.history.history['val_accuracy'], label='Val Acc')
+        plt.title('Model Accuracy')
+        plt.legend()
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(self.history.history['loss'], label='Train Loss')
+        plt.plot(self.history.history['val_loss'], label='Val Loss')
+        plt.title('Model Loss')
+        plt.legend()
+        
+        plt.savefig('training_history.png')
+        plt.close()
+
+if __name__ == "__main__":
+    BASE_PATH = "/kaggle/input/1000-videos-split/1000_videos"
+    TRAIN_PATH = os.path.join(BASE_PATH, "train")
+    VALID_PATH = os.path.join(BASE_PATH, "validation")
+    TEST_PATH = os.path.join(BASE_PATH, "test")
+
+    INPUT_SHAPE = (224, 224, 3)
+    SEQ_LENGTH = 10
+    BATCH_SIZE = 8
+    EPOCHS = 30
+    LEARNING_RATE = 0.001
+
+    try:
+        import socket
+        socket.create_connection(("www.google.com", 80))
+        print("Internet connection available")
+    except OSError:
+        print("No internet connection detected - will use random weights")
+
+    data_prep = DatasetPreparation(input_shape=INPUT_SHAPE, seq_length=SEQ_LENGTH)
+    madnet = EnhancedMADNet(input_shape=INPUT_SHAPE, seq_length=SEQ_LENGTH)
+    trainer = Trainer(madnet.model, learning_rate=LEARNING_RATE)
+
+    train_dataset = data_prep.create_dataset(TRAIN_PATH, batch_size=BATCH_SIZE, augment=True)
+    valid_dataset = data_prep.create_dataset(VALID_PATH, batch_size=BATCH_SIZE)
+    test_dataset = data_prep.create_dataset(TEST_PATH, batch_size=BATCH_SIZE)
+
+    trainer.train(train_dataset, valid_dataset, epochs=EPOCHS, batch_size=BATCH_SIZE)
+    trainer.plot_training_history()
+    trainer.evaluate(test_dataset)
+    trainer.predict_and_analyze(test_dataset)
+    trainer.save_model()
